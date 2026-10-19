@@ -79,6 +79,22 @@ The bridge starts with Claude Code using `sonnet`. `!models` asks the installed 
 
 The bridge listens for hook callbacks only on `127.0.0.1:8787`; do not expose that port publicly.
 
+## Discord controls and context
+
+The bot registers guild slash commands: `/start`, `/list`, `/status`, `/stats`, `/pin`, `/unpin`, `/health`, `/resume`, `/interrupt`, `/stop`, `/sessions`, `/provider`, `/model`, `/git`, and `/cleanup`. Commands are restricted to IDs in `DISCORD_ALLOWED_USER_IDS`. `interrupt` sends Ctrl+C to Claude or requests an interrupt from the Codex app-server; `stop` stops the running process but keeps the channel and saved conversation available for `resume`.
+
+Use `/pin` or `/unpin` (or `!pin` / `!unpin`) in a project channel to keep that project at the top of project lists. Pins persist across bridge restarts. `/health` or `!health` checks the builder's tmux, Claude and Codex CLIs, available project disk space, and user service status.
+
+Requests containing common file-changing or Git operation terms are held for one hour and shown with **Approve once** and **Reject** buttons. Only the submitting user can choose. Approving sends the request to the assistant and adds it to that project's serialized turn queue. This is a keyword-based prompt gate: it does not inspect or replace Claude Code or Codex's own confirmations for tool actions. Turns in each project run one at a time, so messages sent while a turn is active wait in order.
+
+Attach up to five supported files or images to a project-channel message to provide task context. Each file can be up to 10 MB, with a 20 MB combined limit. Files are downloaded from Discord's CDN into a temporary hidden directory inside the project (so Claude's project sandbox can read them) and removed after the assistant finishes. Supported types include text, JSON, YAML, TOML, CSV, PDF, and common image formats.
+
+`/stats` or `!stats` reports whether the assistant is working, prompt count, last activity, and token totals parsed from Claude transcripts or Codex app-server usage notifications. If a Claude transcript contains a cost field, the summary includes it; Codex usage reports tokens, not a cost total. `/git` (or `!git status|diff`) shows repository state; `/git action:commit message:<message>` or `!git commit <message>` commits only changes that are already staged. The bridge never stages files for this command.
+
+`/cleanup days:<days> stop_sessions:true` or `cleanup [days] [stop]` marks inactive project channels as archived in their topic. Project/channel mappings stay available; set `stop_sessions:true` (or add `stop` to the text command) to stop the old process too. The default inactivity threshold is 30 days. Archived channels are restored after a bridge restart and can be resumed normally.
+
+Claude replies are posted when the session stop hook fires, with a completion notice. Codex turns post a completion notice and the final reply when the app-server reports the turn complete.
+
 ## Notes
 
 - Only IDs in `DISCORD_ALLOWED_USER_IDS` can start sessions or send messages through the bridge.

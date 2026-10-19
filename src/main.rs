@@ -9,7 +9,12 @@ use once_cell::sync::OnceCell;
 use serde::Deserialize;
 use serenity::{
     async_trait,
+    builder::{
+        CreateActionRow, CreateButton, CreateCommand, CreateCommandOption,
+        CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
+    },
     http::Http,
+    model::application::{ButtonStyle, CommandOptionType, Interaction},
     model::{
         channel::{ChannelType, Message},
         gateway::Ready,
@@ -48,6 +53,25 @@ struct Session {
     provider: String,
     model: String,
     codex: Option<Arc<Mutex<CodexRuntime>>>,
+    turns: u64,
+    last_activity: u64,
+    pending_files: Vec<PathBuf>,
+    interrupt: Arc<tokio::sync::Notify>,
+    busy: bool,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: Option<f64>,
+    pinned: bool,
+    turn_queue: Arc<Mutex<()>>,
+    turn_done: Arc<tokio::sync::Notify>,
+}
+
+struct PendingApproval {
+    project: String,
+    requester_id: u64,
+    prompt: String,
+    files: Vec<PathBuf>,
+    created_at: u64,
 }
 
 struct CodexRuntime {
@@ -60,6 +84,7 @@ struct CodexRuntime {
 
 struct AppState {
     sessions: HashMap<String, Session>,
+    pending_approvals: HashMap<String, PendingApproval>,
     persistence_path: PathBuf,
     persistence_lock: Arc<Mutex<()>>,
 }
@@ -71,6 +96,20 @@ struct StoredSession {
     model: String,
     claude_session_id: Option<String>,
     codex_thread_id: Option<String>,
+    #[serde(default)]
+    turns: u64,
+    #[serde(default)]
+    last_activity: u64,
+    #[serde(default)]
+    busy: bool,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cost_usd: Option<f64>,
+    #[serde(default)]
+    pinned: bool,
 }
 
 async fn persist_state(state: &Shared) -> Result<()> {
@@ -87,6 +126,13 @@ async fn persist_state(state: &Shared) -> Result<()> {
                 model: s.model.clone(),
                 claude_session_id: s.claude_session_id.clone(),
                 codex_thread_id: s.codex_thread_id.clone(),
+                turns: s.turns,
+                last_activity: s.last_activity,
+                busy: s.busy,
+                input_tokens: s.input_tokens,
+                output_tokens: s.output_tokens,
+                cost_usd: s.cost_usd,
+                pinned: s.pinned,
             })
             .collect::<Vec<_>>();
         (guard.persistence_path.clone(), stored)
@@ -139,6 +185,7 @@ async fn main() -> Result<()> {
     let persistence_path = home.join(".local/state/claude-discord-bridge/sessions.json");
     let state: Shared = Arc::new(RwLock::new(AppState {
         sessions: HashMap::new(),
+        pending_approvals: HashMap::new(),
         persistence_path,
         persistence_lock: Arc::new(Mutex::new(())),
     }));
@@ -213,14 +260,654 @@ struct Handler {
     cfg: Arc<Config>,
 }
 
+async fn register_commands(cfg: &Config, http: &Http) -> Result<()> {
+    let commands = vec![
+        CreateCommand::new("start")
+            .description("Start a new project session")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "project",
+                    "Project directory under PROJECTS_ROOT",
+                )
+                .required(true),
+            ),
+        CreateCommand::new("list").description("List connected project sessions"),
+        CreateCommand::new("status").description("Show this project's status"),
+        CreateCommand::new("stats").description("Show activity and token usage"),
+        CreateCommand::new("pin").description("Pin this project near the top of project lists"),
+        CreateCommand::new("unpin").description("Remove this project pin"),
+        CreateCommand::new("health").description("Check bridge tools and builder disk space"),
+        CreateCommand::new("resume").description("Resume this channel's saved conversation"),
+        CreateCommand::new("interrupt").description("Interrupt the current assistant turn"),
+        CreateCommand::new("stop").description("Stop the session but keep its channel"),
+        CreateCommand::new("sessions")
+            .description("List existing provider conversations for this codebase"),
+        CreateCommand::new("provider")
+            .description("Choose Claude or Codex for this project")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "provider", "Provider")
+                    .required(true)
+                    .add_string_choice("Claude", "claude")
+                    .add_string_choice("Codex", "codex"),
+            )
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::String,
+                "model",
+                "Optional model name",
+            )),
+        CreateCommand::new("model")
+            .description("Choose the model for this project")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "model", "Model name")
+                    .required(true),
+            ),
+        CreateCommand::new("git")
+            .description("Inspect or commit staged project changes")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "action", "Git action")
+                    .required(true)
+                    .add_string_choice("Status", "status")
+                    .add_string_choice("Diff", "diff")
+                    .add_string_choice("Commit staged changes", "commit"),
+            )
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::String,
+                "message",
+                "Commit message (for commit)",
+            )),
+        CreateCommand::new("cleanup")
+            .description("Archive inactive channels; optionally stop old sessions")
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::Integer,
+                "days",
+                "Minimum inactive age in days (default 30)",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::Boolean,
+                "stop_sessions",
+                "Stop old tmux/Codex sessions",
+            )),
+    ];
+    GuildId::new(cfg.guild_id)
+        .set_commands(http, commands)
+        .await?;
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn relative_time(timestamp: u64) -> String {
+    if timestamp == 0 {
+        return "unknown".into();
+    }
+    let seconds = unix_now().saturating_sub(timestamp);
+    if seconds < 60 {
+        "just now".into()
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
+fn stats_summary(session: &Session) -> String {
+    let usage = if session.input_tokens + session.output_tokens > 0 {
+        format!(
+            "{} input / {} output tokens",
+            session.input_tokens, session.output_tokens
+        )
+    } else {
+        "provider token totals unavailable".into()
+    };
+    let cost = session
+        .cost_usd
+        .map(|x| format!(" · transcript cost ${x:.4}"))
+        .unwrap_or_default();
+    format!(
+        "`{}` · {} · {} turns · last activity {} · {}{}",
+        session.project,
+        if session.busy { "working" } else { "idle" },
+        session.turns,
+        relative_time(session.last_activity),
+        usage,
+        cost
+    )
+}
+
+fn transcript_usage(path: Option<&Path>) -> (u64, u64, Option<f64>) {
+    let Some(content) = path.and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return (0, 0, None);
+    };
+    let (mut input, mut output, mut cost) = (0, 0, 0.0);
+    let mut has_cost = false;
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let usage = value
+            .pointer("/message/usage")
+            .or_else(|| value.get("usage"));
+        if let Some(usage) = usage {
+            input += usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                + usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            output += usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+        }
+        if let Some(value) = value
+            .get("costUSD")
+            .or_else(|| value.get("cost_usd"))
+            .and_then(|v| v.as_f64())
+        {
+            cost += value;
+            has_cost = true;
+        }
+    }
+    (input, output, has_cost.then_some(cost))
+}
+
+fn risky_prompt(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    let words = lowered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    [
+        "edit",
+        "write",
+        "modify",
+        "change",
+        "create",
+        "delete",
+        "remove",
+        "install",
+        "commit",
+        "push",
+        "reset",
+        "rebase",
+        "deploy",
+        "overwrite",
+        "rename",
+        "move",
+    ]
+    .iter()
+    .any(|word| words.contains(word))
+}
+
+async fn health_command(cfg: &Config) -> String {
+    async fn check(program: String, arg: &'static str) -> String {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Command::new(&program).arg(arg).output(),
+        )
+        .await
+        {
+            Ok(Ok(output)) if output.status.success() => {
+                let line = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("available")
+                    .trim()
+                    .to_owned();
+                format!("ok ({line})")
+            }
+            Ok(Ok(output)) => format!("error ({})", String::from_utf8_lossy(&output.stderr).trim()),
+            Ok(Err(e)) => format!("unavailable ({e})"),
+            Err(_) => "timed out".into(),
+        }
+    }
+    let tmux = check("tmux".into(), "-V").await;
+    let claude = check(
+        env::var("CLAUDE_COMMAND").unwrap_or_else(|_| "claude".into()),
+        "--version",
+    )
+    .await;
+    let codex = check(
+        env::var("CODEX_COMMAND").unwrap_or_else(|_| "codex".into()),
+        "--version",
+    )
+    .await;
+    let disk = match Command::new("df")
+        .args(["-Pk", cfg.projects_root.to_string_lossy().as_ref()])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .nth(1)
+            .and_then(|line| {
+                let columns = line.split_whitespace().collect::<Vec<_>>();
+                Some(format!(
+                    "{} free · {} used",
+                    human_bytes(columns.get(3)?.parse::<u64>().ok()?.saturating_mul(1024)),
+                    columns.get(4)?
+                ))
+            })
+            .unwrap_or_else(|| "unavailable".into()),
+        _ => "unavailable".into(),
+    };
+    let service = match Command::new("systemctl")
+        .args(["--user", "is-active", "claude-discord-bridge.service"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        _ => "inactive / not installed".into(),
+    };
+    format!("Builder health\nBridge: running\ntmux: {tmux}\nClaude CLI: {claude}\nCodex CLI: {codex}\nProject disk: {disk}\nUser service: {service}")
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+async fn set_pinned(state: &Shared, project: &str, pinned: bool) -> Result<()> {
+    let mut guard = state.write().await;
+    let session = guard
+        .sessions
+        .get_mut(project)
+        .context("project session is no longer registered")?;
+    session.pinned = pinned;
+    drop(guard);
+    persist_state(state).await
+}
+
+async fn download_attachments(msg: &Message, project_dir: &Path) -> Result<Vec<PathBuf>> {
+    anyhow::ensure!(
+        msg.attachments.len() <= 5,
+        "at most five attachments can be sent in one message"
+    );
+    let root = project_dir
+        .join(".bridge-attachments")
+        .join(msg.id.get().to_string());
+    tokio::fs::create_dir_all(&root).await?;
+    let client = reqwest::Client::new();
+    let mut paths = Vec::new();
+    let mut total = 0usize;
+    for (index, attachment) in msg.attachments.iter().enumerate() {
+        let url = reqwest::Url::parse(&attachment.url)?;
+        anyhow::ensure!(
+            url.scheme() == "https"
+                && url
+                    .host_str()
+                    .is_some_and(|h| h == "cdn.discordapp.com" || h == "media.discordapp.net"),
+            "attachment URL is not a Discord CDN URL"
+        );
+        let extension = Path::new(&attachment.filename)
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        anyhow::ensure!(
+            [
+                "txt", "md", "rst", "json", "yaml", "yml", "toml", "csv", "log", "pdf", "png",
+                "jpg", "jpeg", "gif", "webp", "svg"
+            ]
+            .contains(&extension.as_str()),
+            "unsupported attachment type `{extension}`"
+        );
+        anyhow::ensure!(
+            attachment.size <= 10 * 1024 * 1024,
+            "each attachment must be 10 MB or smaller"
+        );
+        total += attachment.size as usize;
+        anyhow::ensure!(
+            total <= 20 * 1024 * 1024,
+            "combined attachments must be 20 MB or smaller"
+        );
+        let response = client.get(url).send().await?.error_for_status()?;
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= 10 * 1024 * 1024),
+            "downloaded attachment exceeds 10 MB"
+        );
+        let bytes = response.bytes().await?;
+        anyhow::ensure!(
+            bytes.len() <= 10 * 1024 * 1024,
+            "downloaded attachment exceeds 10 MB"
+        );
+        total = total
+            .saturating_sub(attachment.size as usize)
+            .saturating_add(bytes.len());
+        anyhow::ensure!(
+            total <= 20 * 1024 * 1024,
+            "downloaded attachments exceed 20 MB combined"
+        );
+        let name = format!("{index}.{}", extension);
+        let path = root.join(name);
+        tokio::fs::write(&path, &bytes).await?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+async fn remove_temp_files(paths: Vec<PathBuf>) {
+    for path in paths {
+        let parent = path.parent().map(Path::to_path_buf);
+        let _ = tokio::fs::remove_file(path).await;
+        if let Some(parent) = parent {
+            let _ = tokio::fs::remove_dir(parent).await;
+        }
+    }
+}
+
+async fn stop_project(state: &Shared, session: &Session) -> Result<()> {
+    if session.provider == "codex" && session.busy {
+        let _ = interrupt_project(session).await;
+    }
+    if let Some(codex) = &session.codex {
+        let mut runtime = codex.lock().await;
+        let _ = runtime._child.start_kill();
+    }
+    if !session.tmux_name.is_empty() && pane_exists(&session.tmux_name).await {
+        let status = Command::new("tmux")
+            .args(["kill-session", "-t", &session.tmux_name])
+            .status()
+            .await?;
+        anyhow::ensure!(status.success(), "tmux could not stop the session");
+    }
+    let mut guard = state.write().await;
+    let pending = guard
+        .sessions
+        .get(&session.project)
+        .map(|s| s.pending_files.clone())
+        .unwrap_or_default();
+    if let Some(s) = guard.sessions.get_mut(&session.project) {
+        s.active = false;
+        s.busy = false;
+        s.codex = None;
+        s.pending_files.clear();
+    }
+    drop(guard);
+    remove_temp_files(pending).await;
+    persist_state(state).await
+}
+
+async fn interrupt_project(session: &Session) -> Result<()> {
+    anyhow::ensure!(
+        session.busy,
+        "there is no active assistant turn to interrupt"
+    );
+    if session.provider == "codex" {
+        session.interrupt.notify_one();
+        return Ok(());
+    }
+    anyhow::ensure!(
+        pane_exists(&session.tmux_name).await,
+        "Claude tmux session is not running"
+    );
+    let status = Command::new("tmux")
+        .args(["send-keys", "-t", &session.pane_id, "C-c"])
+        .status()
+        .await?;
+    anyhow::ensure!(status.success(), "tmux could not send Ctrl+C");
+    Ok(())
+}
+
+async fn git_action(
+    cfg: &Config,
+    session: &Session,
+    action: &str,
+    message: Option<&str>,
+) -> Result<String> {
+    anyhow::ensure!(
+        action == "status" || action == "diff" || action == "commit",
+        "git action must be `status`, `diff`, or `commit`"
+    );
+    let cwd = cfg.projects_root.join(&session.project);
+    if action == "commit" {
+        let message = message
+            .context("usage: `!git commit <message>` (commits only already-staged changes)")?;
+        anyhow::ensure!(!message.trim().is_empty(), "commit message cannot be empty");
+        let output = Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(cwd)
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    }
+    let output = Command::new("git")
+        .args(if action == "diff" {
+            vec!["diff", "HEAD", "--no-ext-diff", "--unified=2"]
+        } else {
+            vec!["status", "--short", "--branch"]
+        })
+        .current_dir(cwd)
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git {action} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok(if text.is_empty() {
+        "Working tree is clean.".into()
+    } else {
+        format!(
+            "```text\n{}\n```",
+            text.chars().take(1800).collect::<String>()
+        )
+    })
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         let _ = BOT_USER_ID.set(ready.user.id.get());
         info!(user = %ready.user.name, "connected to Discord");
+        if let Err(e) = register_commands(&self.cfg, &ctx.http).await {
+            warn!("could not register Discord slash commands: {e:#}");
+        }
         if let Err(e) = self.restore_sessions(&ctx).await {
             warn!("could not restore existing tmux sessions: {e:#}");
         }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let command = match interaction {
+            Interaction::Command(command) => command,
+            Interaction::Component(component) => {
+                self.handle_approval(&ctx, component).await;
+                return;
+            }
+            _ => return,
+        };
+        if !self.cfg.allowed_users.contains(&command.user.id.get()) {
+            let _ = command
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("You are not allowed to use this bridge.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        if command.defer_ephemeral(&ctx.http).await.is_err() {
+            return;
+        }
+        let action = command.data.name.as_str();
+        let args = command.data.options.as_slice();
+        let arg = |name: &str| -> Option<String> {
+            args.iter()
+                .find(|o| o.name == name)
+                .and_then(|o| match &o.value {
+                    serenity::model::application::CommandDataOptionValue::String(s) => {
+                        Some(s.clone())
+                    }
+                    serenity::model::application::CommandDataOptionValue::Integer(i) => {
+                        Some(i.to_string())
+                    }
+                    _ => None,
+                })
+        };
+        let bool_arg = |name: &str| -> bool {
+            args.iter().find(|o| o.name == name).is_some_and(|o| {
+                matches!(
+                    o.value,
+                    serenity::model::application::CommandDataOptionValue::Boolean(true)
+                )
+            })
+        };
+        let result: Result<String> = match action {
+            "start" => {
+                let project = arg("project").unwrap_or_default();
+                start_project(&ctx, &self.cfg, &self.state, &project)
+                    .await
+                    .map(|ch| format!("Started `{project}` in <#{ch}>."))
+            }
+            "list" => {
+                let state = self.state.read().await;
+                let mut sessions = state.sessions.values().collect::<Vec<_>>();
+                sessions.sort_by(|a, b| {
+                    b.pinned
+                        .cmp(&a.pinned)
+                        .then_with(|| a.project.cmp(&b.project))
+                });
+                Ok(if sessions.is_empty() {
+                    "No project sessions started yet.".into()
+                } else {
+                    sessions
+                        .into_iter()
+                        .map(|s| {
+                            format!(
+                                "{} `{}` <#{}> · {} · {} turns",
+                                if s.pinned { "📌" } else { "•" },
+                                s.project,
+                                s.channel_id,
+                                if s.busy { "working" } else { "idle" },
+                                s.turns
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            }
+            "health" => Ok(health_command(&self.cfg).await),
+            "cleanup" => {
+                self.cleanup_sessions(
+                    arg("days").and_then(|x| x.parse().ok()).unwrap_or(30),
+                    bool_arg("stop_sessions"),
+                    &ctx,
+                )
+                .await
+            }
+            "provider" => {
+                let provider = arg("provider").unwrap_or_default();
+                let model = arg("model").unwrap_or_else(|| {
+                    if provider == "codex" {
+                        "default".into()
+                    } else {
+                        "sonnet".into()
+                    }
+                });
+                let current = self
+                    .state
+                    .read()
+                    .await
+                    .sessions
+                    .values()
+                    .find(|s| s.channel_id == command.channel_id.get())
+                    .cloned();
+                match current {
+                    Some(s) => switch_provider(&self.cfg, &self.state, &s, &provider, &model)
+                        .await
+                        .map(|_| {
+                            format!(
+                                "`{}` now uses `{provider}` with model `{model}`.",
+                                s.project
+                            )
+                        }),
+                    None => Err(anyhow!("run this command in a project channel")),
+                }
+            }
+            "model" => {
+                let model = arg("model").unwrap_or_default();
+                let current = self
+                    .state
+                    .read()
+                    .await
+                    .sessions
+                    .values()
+                    .find(|s| s.channel_id == command.channel_id.get())
+                    .cloned();
+                match current {
+                    Some(s) => change_model(&self.state, &s, &model)
+                        .await
+                        .map(|_| format!("`{}` will use `{model}` on its next turn.", s.project)),
+                    None => Err(anyhow!("run this command in a project channel")),
+                }
+            }
+            other => {
+                let current = self
+                    .state
+                    .read()
+                    .await
+                    .sessions
+                    .values()
+                    .find(|s| s.channel_id == command.channel_id.get())
+                    .cloned();
+                match current {
+                    None => Err(anyhow!("run this command in a project channel")),
+                    Some(s) => match other {
+                        "pin" => set_pinned(&self.state, &s.project, true).await.map(|_| format!("Pinned `{}` in project lists.", s.project)),
+                        "unpin" => set_pinned(&self.state, &s.project, false).await.map(|_| format!("Unpinned `{}`.", s.project)),
+                        "status" => Ok(format!("`{}` · {} · model `{}` · {} · {} turns", s.project, s.provider, s.model, if s.busy { "working" } else { "idle" }, s.turns)),
+                        "stats" => Ok(stats_summary(&s)),
+                        "resume" => resume_session(&self.cfg, &self.state, &s).await.map(|_| format!("Resumed `{}`.", s.project)),
+                        "stop" => stop_project(&self.state, &s).await.map(|_| format!("Stopped `{}`; its channel remains available for resume.", s.project)),
+                        "interrupt" => interrupt_project(&s).await.map(|_| format!("Sent an interrupt to `{}`.", s.project)),
+                        "sessions" => if s.provider == "codex" { list_codex_sessions(&self.cfg, &s).await } else { list_claude_sessions(&self.cfg, &s.project).await },
+                        "git" => git_action(&self.cfg, &s, &arg("action").unwrap_or_else(|| "status".into()), arg("message").as_deref()).await,
+                        _ => Ok("Use `/start` to create a session, then `/resume`, `/provider`, `/model`, `/sessions`, `/interrupt`, `/stop`, `/stats`, `/git`, or `/cleanup` in a project channel.".into()),
+                    }
+                }
+            }
+        };
+        let content = result.unwrap_or_else(|e| format!("Bridge command failed: {e:#}"));
+        let _ = command
+            .edit_response(
+                &ctx.http,
+                serenity::builder::EditInteractionResponse::new().content(content),
+            )
+            .await;
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -297,24 +984,60 @@ impl EventHandler for Handler {
                 }
                 "list" => {
                     let s = self.state.read().await;
-                    let out = if s.sessions.is_empty() {
+                    let mut sessions = s.sessions.values().collect::<Vec<_>>();
+                    sessions.sort_by(|a, b| {
+                        b.pinned
+                            .cmp(&a.pinned)
+                            .then_with(|| a.project.cmp(&b.project))
+                    });
+                    let out = if sessions.is_empty() {
                         "No project sessions started yet.".into()
                     } else {
-                        s.sessions
-                            .values()
-                            .map(|x| format!("`{}` <#{}>", x.project, x.channel_id))
+                        sessions
+                            .into_iter()
+                            .map(|x| {
+                                format!(
+                                    "{} `{}` <#{}>",
+                                    if x.pinned { "📌" } else { "•" },
+                                    x.project,
+                                    x.channel_id
+                                )
+                            })
                             .collect::<Vec<_>>()
                             .join("\n")
                     };
                     let _ = msg.channel_id.say(&ctx.http, out).await;
                     return;
                 }
+                "health" => {
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, health_command(&self.cfg).await)
+                        .await;
+                    return;
+                }
+                "cleanup" => {
+                    let days = words
+                        .next()
+                        .and_then(|x| x.parse::<u64>().ok())
+                        .unwrap_or(30);
+                    let stop_sessions = words.any(|word| word == "stop");
+                    match self.cleanup_sessions(days, stop_sessions, &ctx).await {
+                        Ok(text) => {
+                            let _ = msg.channel_id.say(&ctx.http, text).await;
+                        }
+                        Err(e) => {
+                            let _ = msg.reply(&ctx.http, format!("Cleanup failed: {e:#}")).await;
+                        }
+                    }
+                    return;
+                }
                 "help" => {
-                    let _ = msg.channel_id.say(&ctx.http, "Commands: `@HomeLab start <project-directory>`, `@HomeLab connect <project> [claude|codex]`, or `@HomeLab list`. `connect` registers an existing channel without starting a new conversation.").await;
+                    let _ = msg.channel_id.say(&ctx.http, "Slash commands: `/start`, `/list`, `/status`, `/stats`, `/pin`, `/unpin`, `/health`, `/resume`, `/interrupt`, `/stop`, `/sessions`, `/provider`, `/model`, `/git`, `/cleanup`. Text commands: `!interrupt`, `!stop`, `!stats`, `!pin`, `!unpin`, `!health`, `!git status|diff|commit <message>`, and `!cleanup [days] [stop]` in project channels. Risky requests may ask for approval before they are sent. Attach supported files or images to a message to send them as context.").await;
                     return;
                 }
                 _ if is_dm => {
-                    let _ = msg.channel_id.say(&ctx.http, "Commands: `start <project-directory>`, `connect <project> [claude|codex]`, `list`. `connect` registers an existing channel without starting a new conversation.").await;
+                    let _ = msg.channel_id.say(&ctx.http, "Use `/start`, `/list`, or `/cleanup`; or use `start <project-directory>`, `connect <project> [claude|codex]`, `list`, `cleanup [days] [stop]` in a DM or bot mention.").await;
                     return;
                 }
                 _ => {}
@@ -376,7 +1099,7 @@ impl EventHandler for Handler {
                     }
                 }
                 "!models" => {
-                    let result = if session.provider == "codex" {
+                    let result: Result<String> = if session.provider == "codex" {
                         if let Some(c) = &session.codex {
                             c.lock().await.models().await.map(|m| m.join(", "))
                         } else {
@@ -423,6 +1146,101 @@ impl EventHandler for Handler {
                         )
                         .await;
                 }
+                "!interrupt" => match interrupt_project(&session).await {
+                    Ok(()) => {
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, "Sent an interrupt to the active assistant turn.")
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = msg
+                            .reply(&ctx.http, format!("Could not interrupt: {e:#}"))
+                            .await;
+                    }
+                },
+                "!stop" => match stop_project(&self.state, &session).await {
+                    Ok(()) => {
+                        let _ = msg.channel_id.say(&ctx.http, "Stopped the session. The project channel remains available; use `!resume` to continue later.").await;
+                    }
+                    Err(e) => {
+                        let _ = msg
+                            .reply(&ctx.http, format!("Could not stop session: {e:#}"))
+                            .await;
+                    }
+                },
+                "!stats" => {
+                    let _ = msg.channel_id.say(&ctx.http, stats_summary(&session)).await;
+                }
+                "!pin" => match set_pinned(&self.state, &session.project, true).await {
+                    Ok(()) => {
+                        let _ = msg
+                            .channel_id
+                            .say(
+                                &ctx.http,
+                                format!("Pinned `{}` in project lists.", session.project),
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = msg
+                            .reply(&ctx.http, format!("Could not pin project: {e:#}"))
+                            .await;
+                    }
+                },
+                "!unpin" => match set_pinned(&self.state, &session.project, false).await {
+                    Ok(()) => {
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, format!("Unpinned `{}`.", session.project))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = msg
+                            .reply(&ctx.http, format!("Could not unpin project: {e:#}"))
+                            .await;
+                    }
+                },
+                "!cleanup" => {
+                    let days = words
+                        .next()
+                        .and_then(|x| x.parse::<u64>().ok())
+                        .unwrap_or(30);
+                    let stop_sessions = words.any(|word| word == "stop");
+                    match self.cleanup_sessions(days, stop_sessions, &ctx).await {
+                        Ok(text) => {
+                            let _ = msg.channel_id.say(&ctx.http, text).await;
+                        }
+                        Err(e) => {
+                            let _ = msg.reply(&ctx.http, format!("Cleanup failed: {e:#}")).await;
+                        }
+                    }
+                }
+                "!git" => {
+                    let action = words.next().unwrap_or("status");
+                    let message = words.collect::<Vec<_>>().join(" ");
+                    match git_action(
+                        &self.cfg,
+                        &session,
+                        action,
+                        if message.is_empty() {
+                            None
+                        } else {
+                            Some(&message)
+                        },
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let _ = msg.channel_id.say(&ctx.http, text).await;
+                        }
+                        Err(e) => {
+                            let _ = msg
+                                .reply(&ctx.http, format!("Git helper failed: {e:#}"))
+                                .await;
+                        }
+                    }
+                }
                 "!resume" => {
                     let result = resume_session(&self.cfg, &self.state, &session).await;
                     match result {
@@ -437,7 +1255,7 @@ impl EventHandler for Handler {
                     }
                 }
                 "!sessions" => {
-                    let result = if session.provider == "codex" {
+                    let result: Result<String> = if session.provider == "codex" {
                         list_codex_sessions(&self.cfg, &session).await
                     } else {
                         list_claude_sessions(&self.cfg, &session.project).await
@@ -488,36 +1306,85 @@ impl EventHandler for Handler {
                     }
                 }
                 _ => {
-                    let result = if session.provider == "codex" {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, "Codex is working on that…")
-                            .await;
-                        if let Some(c) = &session.codex {
-                            c.lock()
-                                .await
-                                .turn(&msg.content, &session.model)
-                                .await
-                                .map(|answer| Some(answer))
-                        } else {
-                            Err(anyhow!("Codex app-server is not connected"))
-                        }
-                    } else {
-                        send_to_claude(&session, &msg.content).await.map(|_| None)
-                    };
-                    match result {
-                        Ok(Some(answer)) => {
-                            for part in discord_chunks(&answer) {
-                                let _ = msg.channel_id.say(&ctx.http, part).await;
+                    let mut prompt = msg.content.clone();
+                    let mut attached = Vec::new();
+                    if !msg.attachments.is_empty() {
+                        let project_dir = self.cfg.projects_root.join(&session.project);
+                        match download_attachments(&msg, &project_dir).await {
+                            Ok(files) => {
+                                if !files.is_empty() {
+                                    prompt.push_str("\n\nDiscord attachments (read these files as task context):");
+                                    for path in &files {
+                                        prompt.push_str(&format!("\n- {}", path.display()));
+                                    }
+                                    attached = files;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = msg
+                                    .reply(
+                                        &ctx.http,
+                                        format!("Could not retrieve attachment(s): {e:#}"),
+                                    )
+                                    .await;
+                                return;
                             }
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            error!("input delivery failed: {e:#}");
-                            let _ = msg
-                                .reply(&ctx.http, format!("Couldn't deliver input: {e:#}"))
-                                .await;
+                    }
+                    if risky_prompt(&prompt) {
+                        let key = msg.id.get().to_string();
+                        let mut state = self.state.write().await;
+                        let expired = state
+                            .pending_approvals
+                            .iter()
+                            .filter(|(_, pending)| {
+                                unix_now().saturating_sub(pending.created_at) > 3600
+                            })
+                            .map(|(id, _)| id.clone())
+                            .collect::<Vec<_>>();
+                        let mut expired_files = Vec::new();
+                        for id in expired {
+                            if let Some(pending) = state.pending_approvals.remove(&id) {
+                                expired_files.extend(pending.files);
+                            }
                         }
+                        if state.pending_approvals.len() >= 100 {
+                            drop(state);
+                            remove_temp_files(expired_files).await;
+                            remove_temp_files(attached).await;
+                            let _ = msg.reply(&ctx.http, "Too many approval requests are waiting. Resolve one and retry.").await;
+                            return;
+                        }
+                        state.pending_approvals.insert(
+                            key.clone(),
+                            PendingApproval {
+                                project: session.project.clone(),
+                                requester_id: msg.author.id.get(),
+                                prompt,
+                                files: attached.clone(),
+                                created_at: unix_now(),
+                            },
+                        );
+                        drop(state);
+                        remove_temp_files(expired_files).await;
+                        let approval = CreateMessage::new()
+                            .content("This request may change project files, install software, or alter Git history. Approve sending it to the assistant?")
+                            .components(vec![CreateActionRow::Buttons(vec![
+                                CreateButton::new(format!("approve:{key}"))
+                                    .label("Approve once")
+                                    .style(ButtonStyle::Success),
+                                CreateButton::new(format!("reject:{key}"))
+                                    .label("Reject")
+                                    .style(ButtonStyle::Danger),
+                            ])]);
+                        if let Err(e) = msg.channel_id.send_message(&ctx.http, approval).await {
+                            self.state.write().await.pending_approvals.remove(&key);
+                            remove_temp_files(attached).await;
+                            error!("could not send approval controls: {e}");
+                        }
+                    } else {
+                        self.process_turn(&ctx, msg.channel_id, session, prompt, attached)
+                            .await;
                     }
                 }
             }
@@ -526,6 +1393,268 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    async fn handle_approval(
+        &self,
+        ctx: &Context,
+        component: serenity::model::application::ComponentInteraction,
+    ) {
+        let Some((action, key)) = component.data.custom_id.split_once(':') else {
+            return;
+        };
+        if !self.cfg.allowed_users.contains(&component.user.id.get()) {
+            let _ = component
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("You are not allowed to use this bridge.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        let mut state = self.state.write().await;
+        let Some(pending) = state.pending_approvals.get(key) else {
+            drop(state);
+            let _ = component
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("This approval request is no longer available.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        };
+        if unix_now().saturating_sub(pending.created_at) > 3600 {
+            let expired = state.pending_approvals.remove(key).unwrap();
+            drop(state);
+            remove_temp_files(expired.files).await;
+            let _ = component
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .content(
+                                "This approval request expired. Send the request again to retry.",
+                            )
+                            .components(Vec::new()),
+                    ),
+                )
+                .await;
+            return;
+        }
+        if pending.requester_id != component.user.id.get() {
+            drop(state);
+            let _ = component
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("Only the person who submitted this request can approve it.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        let pending = state.pending_approvals.remove(key).unwrap();
+        let session = state.sessions.get(&pending.project).cloned();
+        drop(state);
+        let approving = action == "approve";
+        let response = if approving {
+            format!(
+                "Approved by <@{}>. The request is queued.",
+                component.user.id.get()
+            )
+        } else {
+            "Request rejected; it was not sent to the assistant.".to_owned()
+        };
+        let _ = component
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .content(response)
+                        .components(Vec::new()),
+                ),
+            )
+            .await;
+        if approving {
+            if let Some(session) = session {
+                self.process_turn(
+                    ctx,
+                    component.channel_id,
+                    session,
+                    pending.prompt,
+                    pending.files,
+                )
+                .await;
+            } else {
+                remove_temp_files(pending.files).await;
+            }
+        } else {
+            remove_temp_files(pending.files).await;
+        }
+    }
+
+    async fn process_turn(
+        &self,
+        ctx: &Context,
+        channel_id: ChannelId,
+        session: Session,
+        prompt: String,
+        attached: Vec<PathBuf>,
+    ) {
+        if session.busy {
+            let _ = channel_id
+                .say(&ctx.http, "Your request is queued behind the current turn.")
+                .await;
+        }
+        let _turn_guard = session.turn_queue.lock().await;
+        {
+            let mut state = self.state.write().await;
+            if let Some(s) = state.sessions.get_mut(&session.project) {
+                s.busy = true;
+                s.last_activity = unix_now();
+                if s.provider == "codex" {
+                    s.turns = s.turns.saturating_add(1);
+                    s.active = true;
+                } else {
+                    s.pending_files.extend(attached.iter().cloned());
+                }
+            }
+        }
+        if session.provider == "codex" {
+            let _ = persist_state(&self.state).await;
+        }
+        let _ = channel_id.say(&ctx.http, "Working on it…").await;
+        let result = if session.provider == "codex" {
+            if let Some(codex) = &session.codex {
+                codex
+                    .lock()
+                    .await
+                    .turn(&prompt, &session.model, &session.interrupt)
+                    .await
+                    .map(Some)
+            } else {
+                Err(anyhow!("Codex app-server is not connected"))
+            }
+        } else {
+            send_to_claude(&session, &prompt).await.map(|_| None)
+        };
+        if session.provider == "codex" {
+            if let Some(s) = self.state.write().await.sessions.get_mut(&session.project) {
+                s.active = false;
+                s.busy = false;
+            }
+        }
+        match result {
+            Ok(Some((answer, input_tokens, output_tokens))) => {
+                if let Some(s) = self.state.write().await.sessions.get_mut(&session.project) {
+                    s.input_tokens = input_tokens;
+                    s.output_tokens = output_tokens;
+                }
+                let _ = persist_state(&self.state).await;
+                let _ = channel_id.say(&ctx.http, "Task finished.").await;
+                for part in discord_chunks(&answer) {
+                    let _ = channel_id.say(&ctx.http, part).await;
+                }
+                remove_temp_files(attached).await;
+            }
+            Ok(None) => {
+                if session.provider == "claude" {
+                    let notified = session.turn_done.notified();
+                    if tokio::time::timeout(std::time::Duration::from_secs(900), notified)
+                        .await
+                        .is_err()
+                    {
+                        let mut state = self.state.write().await;
+                        if let Some(s) = state.sessions.get_mut(&session.project) {
+                            s.pending_files.retain(|path| !attached.contains(path));
+                            s.busy = false;
+                        }
+                        drop(state);
+                        remove_temp_files(attached).await;
+                        let _ = persist_state(&self.state).await;
+                        let _ = channel_id.say(&ctx.http, "No completion hook arrived within 15 minutes. The queued turn was released; use `!status` to check the session.").await;
+                    }
+                }
+            }
+            Err(e) => {
+                remove_temp_files(attached.clone()).await;
+                if session.provider == "claude" {
+                    let mut state = self.state.write().await;
+                    if let Some(s) = state.sessions.get_mut(&session.project) {
+                        s.pending_files.retain(|path| !attached.contains(path));
+                        s.busy = false;
+                    }
+                } else {
+                    if let Some(s) = self.state.write().await.sessions.get_mut(&session.project) {
+                        s.busy = false;
+                    }
+                    let _ = persist_state(&self.state).await;
+                }
+                error!("input delivery failed: {e:#}");
+                let _ = channel_id
+                    .say(&ctx.http, format!("Couldn't deliver input: {e:#}"))
+                    .await;
+            }
+        }
+    }
+
+    async fn cleanup_sessions(
+        &self,
+        days: u64,
+        stop_sessions: bool,
+        ctx: &Context,
+    ) -> Result<String> {
+        anyhow::ensure!(days > 0, "cleanup age must be at least one day");
+        let cutoff = unix_now().saturating_sub(days.saturating_mul(86_400));
+        let old = self
+            .state
+            .read()
+            .await
+            .sessions
+            .values()
+            .filter(|s| !s.busy && s.last_activity > 0 && s.last_activity < cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
+        let guild = GuildId::new(self.cfg.guild_id);
+        let mut channels = guild.channels(&ctx.http).await?;
+        let mut archived = 0;
+        for session in old {
+            if let Some(channel) = channels.get_mut(&ChannelId::new(session.channel_id)) {
+                let topic = format!(
+                    "Archived inactive project `{}` · last activity {}",
+                    session.project,
+                    relative_time(session.last_activity)
+                );
+                if let Err(e) = channel
+                    .edit(
+                        &ctx.http,
+                        serenity::builder::EditChannel::new().topic(topic),
+                    )
+                    .await
+                {
+                    warn!(project = %session.project, "could not archive inactive project channel: {e}");
+                    continue;
+                }
+                if stop_sessions {
+                    if let Err(e) = stop_project(&self.state, &session).await {
+                        warn!(project = %session.project, "could not stop archived project session: {e}");
+                    }
+                }
+                archived += 1;
+            }
+        }
+        persist_state(&self.state).await?;
+        Ok(format!("Archived {archived} inactive project channel(s) older than {days} days. Their project/channel links remain available; old sessions {}.", if stop_sessions { "were stopped" } else { "were left running" }))
+    }
+
     async fn restore_sessions(&self, ctx: &Context) -> Result<()> {
         let guild = GuildId::new(self.cfg.guild_id);
         let channels = guild.channels(&ctx.http).await?;
@@ -593,6 +1722,17 @@ impl Handler {
                         .map(|s| s.model.clone())
                         .unwrap_or_else(|| "sonnet".into()),
                     codex: None,
+                    turns: previous.map(|s| s.turns).unwrap_or_default(),
+                    last_activity: previous.map(|s| s.last_activity).unwrap_or_default(),
+                    pending_files: Vec::new(),
+                    interrupt: Arc::new(tokio::sync::Notify::new()),
+                    busy: false,
+                    input_tokens: previous.map(|s| s.input_tokens).unwrap_or_default(),
+                    output_tokens: previous.map(|s| s.output_tokens).unwrap_or_default(),
+                    cost_usd: previous.and_then(|s| s.cost_usd),
+                    pinned: previous.map(|s| s.pinned).unwrap_or(false),
+                    turn_queue: Arc::new(Mutex::new(())),
+                    turn_done: Arc::new(tokio::sync::Notify::new()),
                 },
             );
             restored += 1;
@@ -695,6 +1835,17 @@ async fn start_project(ctx: &Context, cfg: &Config, state: &Shared, name: &str) 
             provider: "claude".into(),
             model: "sonnet".into(),
             codex: None,
+            turns: 0,
+            last_activity: unix_now(),
+            pending_files: Vec::new(),
+            interrupt: Arc::new(tokio::sync::Notify::new()),
+            busy: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: None,
+            pinned: false,
+            turn_queue: Arc::new(Mutex::new(())),
+            turn_done: Arc::new(tokio::sync::Notify::new()),
         },
     );
     persist_state(state).await?;
@@ -808,6 +1959,17 @@ async fn connect_project(
             }
             .to_owned(),
             codex: None,
+            turns: 0,
+            last_activity: unix_now(),
+            pending_files: Vec::new(),
+            interrupt: Arc::new(tokio::sync::Notify::new()),
+            busy: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: None,
+            pinned: false,
+            turn_queue: Arc::new(Mutex::new(())),
+            turn_done: Arc::new(tokio::sync::Notify::new()),
         },
     );
     persist_state(state).await?;
@@ -1417,7 +2579,12 @@ impl CodexRuntime {
             .collect())
     }
 
-    async fn turn(&mut self, prompt: &str, model: &str) -> Result<String> {
+    async fn turn(
+        &mut self,
+        prompt: &str,
+        model: &str,
+        interrupt: &tokio::sync::Notify,
+    ) -> Result<(String, u64, u64)> {
         let id = self.next_id;
         self.next_id += 1;
         let mut params = serde_json::json!({"threadId":self.thread_id,"input":[{"type":"text","text":prompt}],"approvalPolicy":"never","sandboxPolicy":{"type":"workspaceWrite"}});
@@ -1432,11 +2599,30 @@ impl CodexRuntime {
         self.stdin.flush().await?;
         let mut output = String::new();
         let mut acknowledged = false;
+        let mut turn_id: Option<String> = None;
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut interrupt_requested = false;
         loop {
-            let line =
-                tokio::time::timeout(std::time::Duration::from_secs(900), self.stdout.next_line())
-                    .await??
-                    .context("Codex app-server closed stdout during turn")?;
+            let line = tokio::select! {
+                result = tokio::time::timeout(std::time::Duration::from_secs(900), self.stdout.next_line()) => Some(result??.context("Codex app-server closed stdout during turn")?),
+                _ = interrupt.notified() => {
+                    interrupt_requested = true;
+                    None
+                }
+            };
+            let Some(line) = line else {
+                if let Some(turn_id) = turn_id.as_deref() {
+                    let _ = self
+                        .rpc(
+                            "turn/interrupt",
+                            serde_json::json!({"threadId": self.thread_id, "turnId": turn_id}),
+                        )
+                        .await;
+                    return Err(anyhow!("Codex turn interrupted"));
+                }
+                continue;
+            };
             let event: serde_json::Value =
                 serde_json::from_str(&line).context("invalid JSON from Codex app-server")?;
             if event.get("id").and_then(|x| x.as_u64()) == Some(id) {
@@ -1444,8 +2630,37 @@ impl CodexRuntime {
                     return Err(anyhow!("Codex turn failed to start: {error}"));
                 }
                 acknowledged = true;
+                turn_id = event
+                    .pointer("/result/turn/id")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_owned);
             }
             match event.get("method").and_then(|x| x.as_str()) {
+                Some("thread/tokenUsage/updated")
+                    if event.pointer("/params/threadId").and_then(|x| x.as_str())
+                        == Some(&self.thread_id) =>
+                {
+                    if let Some(total) = event.pointer("/params/tokenUsage/total") {
+                        input_tokens = total
+                            .get("inputTokens")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(input_tokens);
+                        output_tokens = total
+                            .get("outputTokens")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(output_tokens);
+                    }
+                }
+                Some("turn/started")
+                    if event.pointer("/params/threadId").and_then(|x| x.as_str())
+                        == Some(&self.thread_id) =>
+                {
+                    turn_id = event
+                        .pointer("/params/turn/id")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_owned)
+                        .or(turn_id);
+                }
                 Some("item/agentMessage/delta") => {
                     if let Some(delta) = event.pointer("/params/delta").and_then(|x| x.as_str()) {
                         output.push_str(delta);
@@ -1473,13 +2688,24 @@ impl CodexRuntime {
                 }
                 _ => {}
             }
+            if interrupt_requested {
+                if let Some(turn_id) = turn_id.as_deref() {
+                    let _ = self
+                        .rpc(
+                            "turn/interrupt",
+                            serde_json::json!({"threadId": self.thread_id, "turnId": turn_id}),
+                        )
+                        .await;
+                    return Err(anyhow!("Codex turn interrupted"));
+                }
+            }
         }
         let _ = acknowledged;
         anyhow::ensure!(
             !output.trim().is_empty(),
             "Codex completed without a text reply"
         );
-        Ok(output)
+        Ok((output, input_tokens, output_tokens))
     }
 }
 
@@ -1515,24 +2741,46 @@ async fn receive_hook(
             s.claude_session_id = Some(id);
         }
         s.active = true;
+        s.busy = false;
     } else if kind == "SessionEnd" {
         if let Some(id) = event.session_id.clone() {
             s.claude_session_id = Some(id);
         }
         s.active = false;
+        s.busy = false;
+    } else if kind == "UserPromptSubmit" {
+        s.busy = true;
+        s.last_activity = unix_now();
+        s.turns = s.turns.saturating_add(1);
+    } else if kind == "Stop" {
+        s.busy = false;
+        let (input, output, cost) = transcript_usage(s.transcript_path.as_deref());
+        s.input_tokens = input;
+        s.output_tokens = output;
+        s.cost_usd = cost;
     }
     let text = match kind {
         "SessionStart" => Some(format!("Claude session started for `{}`.", s.project)),
         "UserPromptSubmit" => Some(format!("Processing your message in `{}`…", s.project)),
         "SessionEnd" => Some(format!("Claude left the active session for `{}`. Send `!resume` here to continue this conversation in `{}`.", s.project, s.project)),
-        "Stop" => latest_assistant_message(s.transcript_path.as_deref()),
+        "Stop" => latest_assistant_message(s.transcript_path.as_deref()).map(|answer| format!("Task finished.\n\n{answer}")),
         _ => None,
     };
+    let pending_files = if kind == "Stop" {
+        std::mem::take(&mut s.pending_files)
+    } else {
+        Vec::new()
+    };
+    let turn_done = s.turn_done.clone();
     if kind == "Stop" && text.is_none() {
         warn!(project = %s.project, transcript = ?s.transcript_path, "Stop hook had no assistant text to post");
     }
     let channel = s.channel_id;
     drop(guard);
+    if kind == "Stop" || kind == "SessionEnd" {
+        turn_done.notify_one();
+    }
+    remove_temp_files(pending_files).await;
     if let Err(e) = persist_state(&state).await {
         error!("could not persist session state: {e:#}");
     }
